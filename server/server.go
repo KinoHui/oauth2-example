@@ -10,17 +10,19 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"oauth2-server/internal/model"
 	"os"
 	"time"
 
-	"github.com/go-oauth2/oauth2/v4/errors"
 	"github.com/go-oauth2/oauth2/v4/generates"
+	"github.com/zeromicro/go-zero/core/stores/sqlx"
+
+	"github.com/go-oauth2/oauth2/v4/errors"
 	"github.com/go-oauth2/oauth2/v4/manage"
 	"github.com/go-oauth2/oauth2/v4/models"
 	"github.com/go-oauth2/oauth2/v4/server"
 	"github.com/go-oauth2/oauth2/v4/store"
 	"github.com/go-session/session/v3"
-	"github.com/golang-jwt/jwt/v4"
 )
 
 var (
@@ -29,14 +31,12 @@ var (
 	secretvar string
 	domainvar string
 	portvar   int
-	db        *MemoryDB
-	jwtSecret = []byte("your-secret-key")
 )
 
 func init() {
 	flag.BoolVar(&dumpvar, "d", true, "Dump requests and responses")
-	flag.StringVar(&idvar, "i", "222222", "The client id being passed in")
-	flag.StringVar(&secretvar, "s", "22222222", "The client secret being passed in")
+	flag.StringVar(&idvar, "i", "test_client_001", "The client id being passed in")
+	flag.StringVar(&secretvar, "s", "test_secret_001", "The client secret being passed in")
 	flag.StringVar(&domainvar, "r", "http://localhost:9094", "The domain of the redirect url")
 	flag.IntVar(&portvar, "p", 9096, "the base port for the server")
 }
@@ -46,32 +46,36 @@ func main() {
 	if dumpvar {
 		log.Println("Dumping requests")
 	}
-
-	// 初始化内存数据库
-	db = NewMemoryDB()
-
 	manager := manage.NewDefaultManager()
 	manager.SetAuthorizeCodeTokenCfg(manage.DefaultAuthorizeCodeTokenCfg)
 
 	// token store
 	manager.MustTokenStorage(store.NewMemoryTokenStore())
 
-	// 使用JWT生成access token
-	manager.MapAccessGenerate(generates.NewJWTAccessGenerate("", jwtSecret, jwt.SigningMethodHS512))
+	// generate jwt access token
+	// manager.MapAccessGenerate(generates.NewJWTAccessGenerate("", []byte("00000000"), jwt.SigningMethodHS512))
+	manager.MapAccessGenerate(generates.NewAccessGenerate())
 
-	// 创建自定义客户端存储
+	// 创建数据库连接
+	conn := sqlx.NewMysql("root:123456@tcp(192.168.59.132:3306)/oauth2?charset=utf8mb4&parseTime=True&loc=Local")
+	clientModel := model.NewClientModel(conn)
+
+	// 创建客户端存储
 	clientStore := store.NewClientStore()
 
-	// 添加一些预定义的客户端用于测试
-	clientStore.Set("test_client", &models.Client{
-		ID:     "test_client",
-		Secret: "test_secret",
-		Domain: domainvar,
-	})
+	// 从数据库加载客户端
+	clients, err := clientModel.FindAll(context.Background())
 
-	// 设置自动授权的客户端
-	db.SetAutoApprove("test_client", true)
-
+	if err == nil {
+		for _, client := range clients {
+			log.Println(client.ID, " ", client.Secret, " ", client.RedirectURL)
+			clientStore.Set(client.ID, &models.Client{
+				ID:     client.ID,
+				Secret: client.Secret,
+				Domain: client.RedirectURL,
+			})
+		}
+	}
 	manager.MapClientStorage(clientStore)
 
 	srv := server.NewServer(server.NewConfig(), manager)
@@ -98,12 +102,6 @@ func main() {
 
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/auth", authHandler)
-
-	// API路由
-	http.HandleFunc("/api/register", RegisterClientHandler)
-	http.HandleFunc("/api/userinfo", UserInfoHandler)
-	http.HandleFunc("/api/set-auto-approve", SetAutoApproveHandler)
-	http.HandleFunc("/api/clients", ListClientsHandler)
 
 	http.HandleFunc("/oauth/authorize", func(w http.ResponseWriter, r *http.Request) {
 		if dumpvar {
@@ -201,27 +199,6 @@ func userAuthorizeHandler(w http.ResponseWriter, r *http.Request) (userID string
 	}
 
 	userID = uid.(string)
-
-	// 检查客户端是否需要自动授权
-	clientID := r.FormValue("client_id")
-	if client, exists := db.GetClient(clientID); exists && client.AutoApprove {
-		// 自动授权，记录权限申请
-		scope := r.FormValue("scope")
-		db.CreateAuthRecord(clientID, userID, scope, true)
-	} else {
-		// 需要用户手动授权，跳转到授权页面
-		store.Set("PendingAuth", map[string]string{
-			"client_id": clientID,
-			"scope":     r.FormValue("scope"),
-			"user_id":   userID,
-		})
-		store.Save()
-
-		w.Header().Set("Location", "/auth")
-		w.WriteHeader(http.StatusFound)
-		return "", nil
-	}
-
 	store.Delete("LoggedInUserID")
 	store.Save()
 	return
@@ -270,44 +247,8 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 检查是否已登录
 	if _, ok := store.Get("LoggedInUserID"); !ok {
 		w.Header().Set("Location", "/login")
-		w.WriteHeader(http.StatusFound)
-		return
-	}
-
-	// 处理授权决定
-	if r.Method == "POST" {
-		if r.Form == nil {
-			if err := r.ParseForm(); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-
-		// 获取待处理的授权信息
-		pendingAuth, ok := store.Get("PendingAuth")
-		if !ok {
-			http.Error(w, "No pending authorization", http.StatusBadRequest)
-			return
-		}
-
-		authInfo := pendingAuth.(map[string]string)
-		clientID := authInfo["client_id"]
-		scope := authInfo["scope"]
-		userID := authInfo["user_id"]
-
-		// 记录用户的授权决定
-		approved := r.Form.Get("action") == "approve"
-		db.CreateAuthRecord(clientID, userID, scope, approved)
-
-		// 清除待处理的授权信息
-		store.Delete("PendingAuth")
-		store.Save()
-
-		// 重定向回OAuth流程
-		w.Header().Set("Location", "/oauth/authorize")
 		w.WriteHeader(http.StatusFound)
 		return
 	}
